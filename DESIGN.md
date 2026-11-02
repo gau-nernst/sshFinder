@@ -105,7 +105,10 @@ from them without remembering commands.
 
 ## Building and testing
 
-- `scripts/bundle.sh` builds `build/sshFinder.app`, drawing the icon with
+- Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds on a
+  GitHub macOS runner and publishes `sshFinder.zip` as a release; running the
+  workflow by hand only builds (zip kept as an artifact).
+- `scripts/bundle.sh` builds `build/sshFinder.app` (`VERSION=` sets its version), drawing the icon with
   `scripts/make-icon.swift` (no image files in the repo). Launch it with
   `open`: started directly from a shell, the release binary opened no window
   in testing.
