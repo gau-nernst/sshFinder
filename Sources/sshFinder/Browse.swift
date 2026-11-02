@@ -36,6 +36,8 @@ struct ActionBar: View {
             .frame(width: 170)
             .padding(.trailing, 4)
             BarButton(symbol: "arrow.clockwise", help: "Refresh") { browser.refresh() }
+            BarButton(symbol: "folder.badge.plus", help: "New folder") { browser.askNewFolder() }
+                .disabled(!browser.canReceive)
             BarButton(symbol: "apple.terminal", title: "Terminal",
                       help: "Open a terminal on this host, in this folder (\(Terminal.hasITerm ? "iTerm2" : "Terminal"))") {
                 if let host = browser.host { Terminal.open(host: host, folder: browser.cwd) }
@@ -80,12 +82,44 @@ struct BrowserPane: View {
     @State private var dropTargeted = false
 
     var body: some View {
+        @Bindable var browser = browser
+        let deleting = browser.deleting ?? []
         FileList()
-            .dropDestination(for: URL.self) { urls, _ in
-                // After the drop returns: the name-clash prompt is modal.
-                DispatchQueue.main.async { browser.upload(urls.filter(\.isFileURL)) }
-                return true
-            } isTargeted: { dropTargeted = $0 }
+            .alert("New Folder", isPresented: shown(\.newFolderName)) {
+                TextField("Name", text: Binding(get: { browser.newFolderName ?? "" }, set: { browser.newFolderName = $0 }))
+                Button("Create") {
+                    let name = browser.newFolderName ?? ""
+                    Task { await browser.createFolder(name) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("In \(browser.cwd)")
+            }
+            .alert("Rename", isPresented: shown(\.renaming), presenting: browser.renaming) { e in
+                TextField("Name", text: $browser.renameText)
+                Button("Rename") {
+                    let name = browser.renameText
+                    Task { await browser.rename(e, to: name) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { e in
+                Text("“\(e.name)” in \(browser.cwd)")
+            }
+            .alert(deleting.count == 1 ? "Delete “\(deleting[0].name)”?" : "Delete \(deleting.count) items?",
+                   isPresented: shown(\.deleting), presenting: browser.deleting) { items in
+                Button("Delete", role: .destructive) { Task { await browser.delete(items) } }
+                Button("Cancel", role: .cancel) {}
+            } message: { items in
+                let names = items.prefix(5).map(\.name).joined(separator: ", ") + (items.count > 5 ? ", …" : "")
+                let folders = items.contains(where: \.isDir) ? " Folders are deleted with everything in them." : ""
+                Text("\(items.count > 1 ? names + "\n\n" : "")From \(browser.host ?? ""):\(browser.cwd). This can't be undone.\(folders)")
+            }
+            .alert(browser.failure?.title ?? "", isPresented: shown(\.failure)) {
+                Button("OK") {}
+            } message: {
+                Text(browser.failure?.message ?? "")
+            }
+            .onDrop(of: [.fileURL], delegate: UploadDrop(browser: browser, targeted: $dropTargeted))
             .overlay {
                 if dropTargeted {
                     RoundedRectangle(cornerRadius: 8)
@@ -101,6 +135,45 @@ struct BrowserPane: View {
                         .allowsHitTesting(false)
                 }
             }
+    }
+
+    /// An alert's isPresented for an optional piece of state: shown while it is
+    /// set, cleared when the alert closes.
+    private func shown<T>(_ key: ReferenceWritableKeyPath<Browser, T?>) -> Binding<Bool> {
+        Binding(get: { browser[keyPath: key] != nil }, set: { if !$0 { browser[keyPath: key] = nil } })
+    }
+}
+
+/// Uploads files dropped from Finder. Rows dragged out of the list carry
+/// `Browser.remoteDragType` and are refused, so they can't come back in as
+/// uploads of themselves.
+struct UploadDrop: DropDelegate {
+    let browser: Browser
+    @Binding var targeted: Bool
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [.fileURL]) && browser.canReceive
+            && !info.itemProviders(for: [.item]).contains { $0.hasItemConformingToTypeIdentifier(Browser.remoteDragType) }
+    }
+
+    func dropEntered(info: DropInfo) { targeted = validateDrop(info: info) }
+    func dropExited(info: DropInfo) { targeted = false }
+
+    func performDrop(info: DropInfo) -> Bool {
+        targeted = false
+        guard validateDrop(info: info) else { return false }
+        var urls: [URL] = []
+        let lock = NSLock(), group = DispatchGroup()
+        for provider in info.itemProviders(for: [.fileURL]) {
+            group.enter()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url, url.isFileURL { lock.lock(); urls.append(url); lock.unlock() }
+                group.leave()
+            }
+        }
+        // After the drop returns: the name-clash prompt is modal.
+        group.notify(queue: .main) { browser.upload(urls) }
+        return true
     }
 }
 
@@ -137,7 +210,7 @@ struct FileList: View {
 
     private var table: some View {
         @Bindable var model = model
-        return Table(model.visibleEntries, selection: $model.selection, sortOrder: $model.sortOrder) {
+        return Table(of: RemoteEntry.self, selection: $model.selection, sortOrder: $model.sortOrder) {
             TableColumn("Name", value: \.name) { e in
                 let (symbol, color) = Self.icon(for: e)
                 Label {
@@ -158,6 +231,11 @@ struct FileList: View {
                     .help(e.modified.formatted(date: .abbreviated, time: .standard))
             }
             .width(min: 110, ideal: 140)
+        } rows: {
+            ForEach(model.visibleEntries) { e in
+                // Dragged to Finder, a row downloads to where it is dropped.
+                TableRow(e).itemProvider { model.dragProvider(for: e) }
+            }
         }
         .contextMenu(forSelectionType: RemoteEntry.ID.self) { ids in
             if !ids.isEmpty {
@@ -165,6 +243,15 @@ struct FileList: View {
                 Button("Copy") { model.copy(ids) }
                     .help("Then paste in a folder on any host, in this tab or another")
                 Button("Copy Path") { model.copyPaths(ids) }
+                Divider()
+                Button("Rename…") { model.askRename(ids) }
+                    .disabled(ids.count != 1 || !model.canReceive)
+                Button("Delete…", role: .destructive) { model.askDelete(ids) }
+                    .disabled(!model.canReceive)
+            }
+            if ids.isEmpty {
+                Button("New Folder") { model.askNewFolder() }
+                    .disabled(!model.canReceive)
             }
             if let clip = model.store.clipboard {
                 Divider()
@@ -174,6 +261,7 @@ struct FileList: View {
         } primaryAction: { ids in
             model.activate(ids)
         }
+        .onDeleteCommand { model.askDelete(model.selection) }
     }
 
     /// A symbol and tint by kind, so text, data, code and archives stand apart.

@@ -27,7 +27,19 @@ from them without remembering commands.
     temp name.
   - Name clashes ask: Keep Both (numbered name) or Replace. Only a file can
     replace a file; a folder is never replaced or merged.
-  - No resume for uploads, and no delete or rename of remote files.
+  - No resume for uploads.
+- **New Folder:** action bar button or right-click on empty space; asks for a
+  name ("untitled folder", numbered if taken) and runs `mkdir` without `-p`,
+  so an existing name fails with its error instead of being reused.
+- **Rename and Delete:** right-click a row. Rename refuses a name that already
+  exists (so `mv` never replaces a file or moves into a folder). Delete (also
+  the Delete key) confirms first, naming the items and the folder, then runs
+  `rm -rf` on those names only: never `.`, `..` or anything with `/`.
+- **Drag to Finder:** a dragged row is a file promise. The download starts
+  when it is dropped, into a temp folder under the cache (emptied at launch),
+  shows in Transfers, and Finder copies the result to the drop location.
+  These drags carry a private marker type, so dropping them back on the list
+  is refused instead of uploading them again.
 - **Host to host:** right-click → Copy, then Paste (toolbar or right-click on
   empty space) in a folder on any host, in this tab or another. The data
   streams through this Mac (`ssh A cat|tar` → `ssh B`), into the same receive
@@ -55,7 +67,8 @@ from them without remembering commands.
   first folder returns to its start page. Saved and recent hosts, the
   clipboard and the Transfers panel are shared by all tabs.
 - **Features:**
-  - Browse folders, newest first by default, with a filter box.
+  - Browse folders, newest first by default, with a filter box. Folders are
+    always listed before files, each group in the chosen order.
   - Saved hosts (☆ on a host row) and Recent hosts; each host reopens its
     last folder. Saved folders may come later.
   - The connect box suggests hosts from `~/.ssh/config` while typing. Every
@@ -125,7 +138,7 @@ from them without remembering commands.
   Screen Recording permission needed), optionally after `SSHFINDER_NEWTAB=1`,
   `SSHFINDER_OPEN=<host:/path>` or `SSHFINDER_QUERY=<text>`. Scroll views draw
   blank in these images even though they render normally on screen.
-- `SSHFINDER_UITEST=connect|browse|all` drives the app like a person and
+- `SSHFINDER_UITEST=connect|browse|folder|all` drives the app like a person and
   prints PASS/FAIL: it types through the focused field (so focus bugs show)
   and sends real mouse clicks to views marked `.testTarget(name)` and to file
   list rows. It needs `SSHFINDER_UITEST_HOST` (a host whose `/tmp` it

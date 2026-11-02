@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Observation
+import UniformTypeIdentifiers
 
 struct Location: Hashable {
     let host: String
@@ -55,13 +56,24 @@ struct Location: Hashable {
     var hostQuery = ""
     var loading = false
     var error: String?
+    /// Non-nil while the New Folder prompt is up: the name being typed.
+    var newFolderName: String?
+    /// Non-nil while the Rename prompt is up, with the name being typed.
+    var renaming: RemoteEntry?
+    var renameText = ""
+    /// Non-nil while Delete waits for confirmation.
+    var deleting: [RemoteEntry]?
+    /// A failed folder operation, shown as an alert.
+    var failure: (title: String, message: String)?
     private var backStack: [Location] = []
     private var loadToken = 0
 
     var visibleEntries: [RemoteEntry] {
         let q = filter.trimmingCharacters(in: .whitespaces)
         let shown = q.isEmpty ? entries : entries.filter { $0.name.localizedCaseInsensitiveContains(q) }
-        return shown.sorted(using: sortOrder)
+        // Folders first, each group in the chosen order.
+        let sorted = shown.sorted(using: sortOrder)
+        return sorted.filter(\.isDir) + sorted.filter { !$0.isDir }
     }
 
     // Back from the first folder of a tab returns to its start page.
@@ -102,9 +114,9 @@ struct Location: Hashable {
                  select: (cwd as NSString).lastPathComponent)
     }
 
-    func refresh() {
+    func refresh(select name: String? = nil) {
         guard let host else { return }
-        load(Location(host: host, path: cwd))
+        load(Location(host: host, path: cwd), select: name)
     }
 
     /// Accepts "host:/path", "host", or a path on the current host.
@@ -264,6 +276,99 @@ struct Location: Hashable {
             taken.insert(picked)
             return (picked, false)
         }
+    }
+
+    // MARK: Changing the folder
+
+    func askNewFolder() {
+        guard canReceive else { return }
+        newFolderName = numberedName("untitled folder") { name in entries.contains { $0.name == name } }
+    }
+
+    /// Makes a folder here, then selects it. `mkdir` without -p, so an existing
+    /// name fails instead of being reused.
+    func createFolder(_ name: String) async {
+        let name = name.trimmingCharacters(in: .whitespaces)
+        guard isValidName(name, for: "Couldn't create the folder") else { return }
+        await runHere("mkdir -- \(SSH.quote(name))", failing: "Couldn't create the folder", select: name)
+    }
+
+    func askRename(_ ids: Set<RemoteEntry.ID>) {
+        guard canReceive, ids.count == 1, let e = entries.first(where: { ids.contains($0.id) }) else { return }
+        renameText = e.name
+        renaming = e
+    }
+
+    /// Renames within this folder, refusing a name that already exists rather
+    /// than letting `mv` replace it (or move into it, for a folder).
+    func rename(_ e: RemoteEntry, to newName: String) async {
+        let name = newName.trimmingCharacters(in: .whitespaces)
+        guard name != e.name, isValidName(name, for: "Couldn't rename") else { return }
+        let new = SSH.quote(name)
+        await runHere("if [ -e \(new) ] || [ -L \(new) ]; then printf '%s already exists\\n' \(new) >&2; exit 1; fi"
+                      + " && mv -- \(SSH.quote(e.name)) \(new)", failing: "Couldn't rename", select: name)
+    }
+
+    func askDelete(_ ids: Set<RemoteEntry.ID>) {
+        guard canReceive else { return }
+        let chosen = entries.filter { ids.contains($0.id) }
+        if !chosen.isEmpty { deleting = chosen }
+    }
+
+    /// Deletes entries of this folder, folders with everything in them. Only
+    /// names listed here: never this folder itself or anything above it.
+    func delete(_ items: [RemoteEntry]) async {
+        let names = items.map(\.name).filter { !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") }
+        guard !names.isEmpty else { return }
+        await runHere("rm -rf -- " + names.map(SSH.quote).joined(separator: " "),
+                      failing: "Couldn't delete", timeout: 3600)
+    }
+
+    private func isValidName(_ name: String, for title: String) -> Bool {
+        guard name.isEmpty || name == "." || name == ".." || name.contains("/") else { return true }
+        failure = (title, "A name can't be empty, “.”, “..”, or contain “/”.")
+        return false
+    }
+
+    /// Runs a command in the folder this tab shows, then refreshes it if the
+    /// tab is still there, selecting `select`.
+    private func runHere(_ command: String, failing title: String, select: String? = nil,
+                         timeout: TimeInterval = 30) async {
+        guard let host, canReceive else { return }
+        let dir = cwd
+        loading = true
+        defer { if self.host == host && cwd == dir { refresh(select: select) } }
+        do {
+            let r = try await SSH.remote(host, "cd \(SSH.quote(dir)) && \(command)", timeout: timeout)
+            if r.status != 0 { failure = (title, SSH.errorMessage(r)) }
+        } catch {
+            failure = (title, error.localizedDescription)
+        }
+    }
+
+    /// Marks drags that start in the list, so the list refuses them as uploads.
+    nonisolated static let remoteDragType = "io.github.gau-nernst.sshFinder.remote-item"
+
+    /// What a row offers when dragged: the file (or folder) itself, downloaded
+    /// only once it is dropped somewhere that wants it, like Finder.
+    func dragProvider(for e: RemoteEntry) -> NSItemProvider? {
+        guard let host else { return nil }
+        let provider = NSItemProvider()
+        provider.suggestedName = e.name
+        let type = e.isDir ? UTType.folder : (UTType(filenameExtension: (e.name as NSString).pathExtension) ?? .data)
+        let transfers = store.transfers
+        provider.registerFileRepresentation(forTypeIdentifier: type.identifier, fileOptions: [], visibility: .all) { done in
+            Task { @MainActor in
+                do { done(try await transfers.downloadForDrag(host: host, entry: e), false, nil) }
+                catch { done(nil, false, error) }
+            }
+            return nil
+        }
+        provider.registerDataRepresentation(forTypeIdentifier: Self.remoteDragType, visibility: .ownProcess) { done in
+            done(Data(), nil)
+            return nil
+        }
+        return provider
     }
 
     func copyPaths(_ ids: Set<RemoteEntry.ID>) {

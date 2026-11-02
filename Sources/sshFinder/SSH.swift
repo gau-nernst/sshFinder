@@ -73,6 +73,8 @@ enum SSH {
         signal(SIGPIPE, SIG_IGN)
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
+        // Files from drags to Finder in earlier runs; Finder has copied them by now.
+        try? FileManager.default.removeItem(at: cacheDir.appendingPathComponent("drag"))
         // Passwords, 2FA codes and new host keys are asked through a macOS dialog.
         let script = """
         #!/bin/sh

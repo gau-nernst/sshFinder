@@ -34,6 +34,10 @@ extension Notification.Name {
     var bytesPerSecond: Double = 0
     /// Download: the local destination, picked when it starts. Upload: the source.
     var localURL: URL?
+    /// Download only: the folder to download into, instead of ~/Downloads.
+    var destination: URL?
+    /// Called once when it finishes, with where it landed or why it failed.
+    var onFinish: ((Result<URL, Error>) -> Void)?
     var note: String?
     fileprivate var cancelBox = CancelBox()
 
@@ -101,9 +105,34 @@ func numberedName(_ name: String, isTaken: (String) -> Bool) -> String {
         pump()
     }
 
+    /// Downloads into a fresh temp folder for a drag to Finder, which copies
+    /// the result to where it was dropped. Shows in the list like any download.
+    func downloadForDrag(host: String, entry: RemoteEntry) async throws -> URL {
+        let dir = Self.dragFolder.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let t = Transfer(.download, host: host, remotePath: entry.path, isDir: entry.isDir)
+        t.destination = dir
+        items.insert(t, at: 0)
+        return try await withCheckedThrowingContinuation { cont in
+            t.onFinish = { cont.resume(with: $0) }
+            pump()
+        }
+    }
+
+    /// Where drag downloads wait for Finder to copy them; emptied at launch.
+    static let dragFolder = SSH.cacheDir.appendingPathComponent("drag")
+
     func cancel(_ t: Transfer) {
-        if t.status == .queued { t.status = .cancelled }
+        if t.status == .queued {
+            t.status = .cancelled
+            finish(t, .failure(CancellationError()))
+        }
         t.cancelBox.cancel()
+    }
+
+    private func finish(_ t: Transfer, _ result: Result<URL, Error>) {
+        t.onFinish?(result)
+        t.onFinish = nil
     }
 
     func retry(_ t: Transfer) {
@@ -140,14 +169,17 @@ func numberedName(_ name: String, isTaken: (String) -> Bool) -> String {
                     case (.copy, true): try await relayFolder(t)
                     }
                     t.status = .done
+                    if let url = t.localURL { finish(t, .success(url)) }
                     if t.direction != .download {
                         NotificationCenter.default.post(name: .remoteFolderChanged, object: nil,
                                                         userInfo: ["host": t.host, "dir": t.remoteDir])
                     }
                 } catch is CancellationError {
                     t.status = .cancelled
+                    finish(t, .failure(CancellationError()))
                 } catch {
                     t.status = .failed(error.localizedDescription)
+                    finish(t, .failure(error))
                 }
                 if t.direction == .download, let url = t.localURL { reserved.remove(url.path) }
                 pump()
@@ -157,13 +189,13 @@ func numberedName(_ name: String, isTaken: (String) -> Bool) -> String {
 
     // MARK: Downloads
 
-    /// A free name in Downloads, also avoiding names other downloads have taken.
-    private func reserveName(_ name: String) -> URL {
+    /// A free name in `dir`, also avoiding names other downloads have taken.
+    private func reserveName(_ name: String, in dir: URL) -> URL {
         let picked = numberedName(name) {
-            let path = folder.appendingPathComponent($0).path
+            let path = dir.appendingPathComponent($0).path
             return FileManager.default.fileExists(atPath: path) || reserved.contains(path)
         }
-        let url = folder.appendingPathComponent(picked)
+        let url = dir.appendingPathComponent(picked)
         reserved.insert(url.path)
         return url
     }
@@ -187,13 +219,13 @@ func numberedName(_ name: String, isTaken: (String) -> Bool) -> String {
             reserved.insert(dest.path)
         } else {
             let existing = folder.appendingPathComponent(t.name)
-            if fileSize(existing) == total {
+            if t.destination == nil, fileSize(existing) == total {
                 t.localURL = existing
                 t.done = total
                 t.note = "Already in Downloads"
                 return
             }
-            dest = reserveName(t.name)
+            dest = reserveName(t.name, in: t.destination ?? folder)
             t.localURL = dest
         }
 
@@ -231,9 +263,10 @@ func numberedName(_ name: String, isTaken: (String) -> Bool) -> String {
         let q = SSH.quote(t.remotePath)
         t.total = (try? await SSH.remote(t.host, Self.tarSizeCommand(t.remotePath), timeout: 60))?.number ?? 0
 
-        let dest = reserveName(t.name)
+        let base = t.destination ?? folder
+        let dest = reserveName(t.name, in: base)
         t.localURL = dest
-        let tmp = folder.appendingPathComponent(".\(t.name).sshFinder-\(t.id.uuidString.prefix(8))")
+        let tmp = base.appendingPathComponent(".\(t.name).sshFinder-\(t.id.uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
 
         let tar = Self.localTar(["-xf", "-", "-C", tmp.path])
